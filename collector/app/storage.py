@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
 SCHEMA = """
@@ -30,12 +31,17 @@ PRAGMA foreign_keys=ON;
 PRAGMA busy_timeout=5000;
 
 CREATE TABLE IF NOT EXISTS ingest_state (
-    dev          INTEGER NOT NULL,
-    inode        INTEGER NOT NULL,
-    source_code  TEXT    NOT NULL,
-    path         TEXT    NOT NULL,
-    offset       INTEGER NOT NULL,
-    last_seen    TEXT    NOT NULL,
+    dev            INTEGER NOT NULL,
+    inode          INTEGER NOT NULL,
+    source_code    TEXT    NOT NULL,
+    path           TEXT    NOT NULL,
+    offset         INTEGER NOT NULL,
+    last_seen      TEXT    NOT NULL,
+    -- A file is blocked when a single line exceeds max_line_bytes. The
+    -- committed offset stays at that line's start; these columns explain why
+    -- progress has stopped. NULL means the file is draining normally.
+    blocked_reason TEXT,
+    blocked_at     TEXT,
     PRIMARY KEY (dev, inode)
 );
 
@@ -94,6 +100,16 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate_state_columns(conn)
+
+
+def _migrate_state_columns(conn: sqlite3.Connection) -> None:
+    """Add block-marker columns to databases created by an earlier version."""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(ingest_state)")}
+    if "blocked_reason" not in existing:
+        conn.execute("ALTER TABLE ingest_state ADD COLUMN blocked_reason TEXT")
+    if "blocked_at" not in existing:
+        conn.execute("ALTER TABLE ingest_state ADD COLUMN blocked_at TEXT")
 
 
 @contextmanager
@@ -114,6 +130,50 @@ def get_state(conn: sqlite3.Connection, dev: int, inode: int) -> Optional[sqlite
         "SELECT * FROM ingest_state WHERE dev = ? AND inode = ?",
         (dev, inode),
     ).fetchone()
+
+
+def upsert_state(
+    conn: sqlite3.Connection,
+    *,
+    dev: int,
+    inode: int,
+    source_code: str,
+    path: str,
+    offset: int,
+    blocked_reason: Optional[str],
+    blocked_at: Optional[str],
+) -> None:
+    """Persist the next read position together with the batch just written.
+
+    ``blocked_at`` is stamped only on the transition into the blocked state;
+    while the same oversized line is reported poll after poll, the original
+    timestamp is preserved. Passing ``blocked_reason=None`` clears a previous
+    block (e.g. after the line was shortened).
+    """
+    conn.execute(
+        """INSERT INTO ingest_state
+               (dev, inode, source_code, path, offset, last_seen,
+                blocked_reason, blocked_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(dev, inode) DO UPDATE SET
+               source_code    = excluded.source_code,
+               path           = excluded.path,
+               offset         = excluded.offset,
+               last_seen      = excluded.last_seen,
+               blocked_reason = excluded.blocked_reason,
+               -- Keep the original timestamp while the same block persists;
+               -- stamp a fresh one only on a new block, and clear it once a
+               -- block is resolved (excluded.blocked_reason IS NULL).
+               blocked_at     = CASE
+                   WHEN excluded.blocked_reason IS NULL THEN NULL
+                   WHEN ingest_state.blocked_reason IS NOT NULL
+                        THEN ingest_state.blocked_at
+                   ELSE excluded.blocked_at
+               END""",
+        (dev, inode, source_code, path, offset,
+         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+         blocked_reason, blocked_at),
+    )
 
 
 def all_states(conn: sqlite3.Connection) -> list[sqlite3.Row]:

@@ -29,6 +29,12 @@ services:
       DB_PATH: /data/warehouse.db
       LOG_DIR: /logs
       POLL_INTERVAL: "0.5"
+      # 每轮每个文件最多读取的字节数：大文件分多轮排空，单轮内存有上限，
+      # 排在后面的短日志每轮都能获得一次采集机会。
+      READ_CHUNK_BYTES: "${READ_CHUNK_BYTES:-1048576}"
+      # 单行字节上限（不含 '\n'）；超限的行不会被拆开或跳过，文件停在该行
+      # 起始偏移并在 /ingest/progress 中报告 blocked 原因。
+      MAX_LINE_BYTES: "${MAX_LINE_BYTES:-262144}"
       LOG_LEVEL: INFO
     volumes:
       # 题目要求：采集共享只读目录中的日志

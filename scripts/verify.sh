@@ -14,12 +14,23 @@ import json, sys
 d = json.load(sys.stdin)
 ok = True
 for f in d["files"]:
-    state = "complete" if f["complete"] else "PENDING"
-    if not f["complete"] and f["size"] is not None:
+    if f.get("blocked"):
+        state = "BLOCKED"
         ok = False
+    elif f["complete"]:
+        state = "complete"
+    else:
+        state = "PENDING"
+        if f["size"] is not None:
+            ok = False
     print(f"  [{state:7}] {f[\"source_code\"]:<40} "
           f"offset={f[\"offset\"]} size={f[\"size\"]} inode={f[\"inode\"]}")
+    if f.get("blocked"):
+        print(f"             reason: {f[\"blocked_reason\"]}")
 print()
+print("blocked files:", d.get("blocked_count", 0),
+      "| read_chunk_bytes:", d.get("read_chunk_bytes"),
+      "| max_line_bytes:", d.get("max_line_bytes"))
 print("counts:", d["counts"])
 sys.exit(0 if ok else 1)
 '

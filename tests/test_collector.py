@@ -447,12 +447,14 @@ def test_offset_math_after_partial():
 
 
 def test_multibyte_offsets_and_chunk_boundaries():
-    print("\n[9] 多字节 UTF-8：字节偏移精确、跨块字符不损坏")
-    import app.ingest as ingest_mod
+    print("\n[9] 多字节 UTF-8：字节偏移精确、跨读取块字符不损坏（分轮排空）")
     base, log_dir, db_path, conn = fresh_env()
-    # Force tiny reads so multi-byte chars and newlines straddle chunks.
-    original_chunk = ingest_mod.READ_CHUNK
-    ingest_mod.READ_CHUNK = 7
+    # Tiny bounded reads: multi-byte chars, newlines and partial tails all
+    # straddle chunk boundaries. The line limit sits above the longest real
+    # line so chunking — not oversized-line protection — drives this test;
+    # every line therefore arrives reassembled from several chunks.
+    chunk = 7
+    max_line = 512
     try:
         f = os.path.join(log_dir, "access.log")
         lines = [
@@ -464,11 +466,24 @@ def test_multibyte_offsets_and_chunk_boundaries():
         with open(f, "wb") as fh:
             for ln in lines:
                 fh.write(ln.encode("utf-8"))
-        poll_once(conn, log_dir)
+        # One bounded chunk per poll: each file drains over several ticks.
+        # A shared carry registry mirrors the real CollectorLoop: a line
+        # straddling chunks is reassembled across polls while the committed
+        # offset stays at the line's first byte. Early polls may hold only a
+        # partial tail and persist no state yet.
+        carries = {}
+        for _ in range(500):
+            r = poll_once(conn, log_dir, read_chunk_bytes=chunk,
+                          max_line_bytes=max_line, carries=carries)
+            states = storage.all_states(conn)
+            if states and states[0]["offset"] == os.path.getsize(f):
+                break
+            assert r["bytes_read"] <= chunk, "single poll exceeds byte budget"
         rows = conn.execute(
             "SELECT byte_offset, path, raw_line FROM log_events ORDER BY id"
         ).fetchall()
-        check("all 4 multibyte lines ingested", len(rows) == 4)
+        check("all 4 multibyte lines ingested across chunk boundaries",
+              len(rows) == 4)
         raw = open(f, "rb").read()
         expected_offsets, cursor = [], 0
         for ln in lines:
@@ -488,7 +503,312 @@ def test_multibyte_offsets_and_chunk_boundaries():
               ["/unicafé/✓", "/ascii/normal", "/中文/路径", "/emoji/😀/end"],
               str([r["path"] for r in rows]))
     finally:
-        ingest_mod.READ_CHUNK = original_chunk
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_bounded_bytes_per_poll():
+    print("\n[10] 单文件每轮只读有限字节，大文件分多批入仓、内存有界")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        line = jline("/bulk", 200)
+        n_lines = 200
+        with open(f, "w") as fh:
+            for _ in range(n_lines):
+                fh.write(line)
+        size = os.path.getsize(f)
+
+        chunk = 4096  # far smaller than the whole file
+        carries = {}
+        r1 = poll_once(conn, log_dir, read_chunk_bytes=chunk,
+                       max_line_bytes=chunk - 1, carries=carries)
+        check("first poll reads at most the byte budget",
+              r1["bytes_read"] <= chunk, str(r1["bytes_read"]))
+        check("first poll ingests only a bounded batch",
+              0 < r1["ingested"] < n_lines, str(r1["ingested"]))
+        st = storage.all_states(conn)[0]
+        check("committed offset never passes the last newline",
+              st["offset"] <= size and st["offset"] == r1["files"][0]["offset"])
+        rows_first = conn.execute(
+            "SELECT COUNT(*) c FROM log_events").fetchone()["c"]
+
+        # Drain to EOF over successive polls.
+        polls = 1
+        for _ in range(500):
+            r = poll_once(conn, log_dir, read_chunk_bytes=chunk,
+                          max_line_bytes=chunk - 1, carries=carries)
+            polls += 1
+            check("every poll respects the per-file byte budget",
+                  r["bytes_read"] <= chunk, str(r["bytes_read"]))
+            if storage.all_states(conn)[0]["offset"] == size:
+                break
+        check("large file needed multiple polls (no whole-file read)",
+              polls > 1, f"polls={polls}")
+        n = conn.execute("SELECT COUNT(*) c FROM log_events").fetchone()["c"]
+        check("every line eventually ingested exactly once",
+              n == n_lines, f"n={n}")
+        check("first batch rows were not re-recorded",
+              rows_first <= n and conn.execute(
+                  "SELECT COUNT(*) c FROM (SELECT DISTINCT byte_offset "
+                  "FROM log_events)").fetchone()["c"] == n_lines)
+        check("final offset equals file size",
+              storage.all_states(conn)[0]["offset"] == size)
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_fairness_other_files_not_starved():
+    print("\n[11] 大文件不独占采集轮次：每轮每个文件都有一次机会")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        big = os.path.join(log_dir, "access.log")
+        small = os.path.join(log_dir, "short.log")
+        line = jline("/big", 200)
+        with open(big, "w") as fh:
+            for _ in range(300):
+                fh.write(line)
+        with open(small, "w") as fh:
+            for _ in range(3):
+                fh.write(jline("/short", 503))
+
+        chunk = 1024
+        r = poll_once(conn, log_dir, read_chunk_bytes=chunk,
+                      max_line_bytes=chunk - 1)
+        by_src = {x["source_code"]: x for x in r["files"]}
+        check("both files visited in one poll", set(by_src) ==
+              {"access.log", "short.log"}, str(sorted(by_src)))
+        check("large file read only one bounded chunk",
+              0 < by_src["access.log"]["bytes_read"] <= chunk,
+              str(by_src["access.log"]))
+        check("small file fully drained on the first shared poll",
+              by_src["short.log"]["offset"] == by_src["short.log"]["size"]
+              and by_src["short.log"]["ingested"] == 3,
+              str(by_src["short.log"]))
+        small_rows = conn.execute(
+            "SELECT COUNT(*) c FROM log_events WHERE source_code = 'short.log'"
+        ).fetchone()["c"]
+        check("short log already in the warehouse while big log remains",
+              small_rows == 3 and
+              conn.execute(
+                  "SELECT COUNT(*) c FROM log_events WHERE source_code = "
+                  "'access.log'").fetchone()["c"] < 300)
+        check("per-poll result exposes the active limits",
+              r["read_chunk_bytes"] == chunk and
+              r["max_line_bytes"] == chunk - 1)
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_oversized_line_blocks_with_reason():
+    print("\n[12] 单行超过批次处理能力：保留原偏移并在进度中说明阻塞原因")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        # Short, hand-written JSON lines keep the fixture below every limit;
+        # only the deliberately huge physical line is oversized.
+        good = '{"path":"/ok","status":200}\n'
+        after = '{"path":"/after","status":500}\n'
+        with open(f, "wb") as fh:
+            fh.write(good.encode())
+            # One physical line (terminated) longer than the limit.
+            fh.write(b"x" * 400)
+            fh.write(b"\n")
+            fh.write(after.encode())
+
+        max_line, chunk = 64, 128
+        carries = {}
+        r = poll_once(conn, log_dir, read_chunk_bytes=chunk,
+                      max_line_bytes=max_line, carries=carries)
+        blk = [x for x in r["files"] if x["blocked"]]
+        check("poll reports one blocked file", len(blk) == 1, str(r["files"]))
+        check("top-level blocked_files summary populated",
+              len(r["blocked_files"]) == 1 and
+              "max_line_bytes" in r["blocked_files"][0]["reason"])
+        st = storage.all_states(conn)[0]
+        line_start = len(good.encode())
+        check("committed offset held at the oversized line's start",
+              st["offset"] == line_start and st["blocked_reason"] is not None,
+              str(dict(st)))
+        check("rows before the oversized line were committed",
+              conn.execute(
+                  "SELECT COUNT(*) c FROM log_events").fetchone()["c"] == 1)
+        check("rows after the oversized line were not reached",
+              conn.execute(
+                  "SELECT COUNT(*) c FROM log_events WHERE path = '/after'"
+              ).fetchone()["c"] == 0)
+
+        # Re-polling must not split, skip or record the line again.
+        r2 = poll_once(conn, log_dir, read_chunk_bytes=chunk,
+                       max_line_bytes=max_line, carries=carries)
+        st2 = storage.all_states(conn)[0]
+        check("block persists and offset is unchanged on repeat polls",
+              st2["offset"] == line_start and r2["blocked_files"] and
+              st2["blocked_reason"] is not None
+              and st2["blocked_at"] == st["blocked_at"],
+              str(dict(st2)))
+        check("still exactly one ingested row (no duplicates)",
+              conn.execute(
+                  "SELECT COUNT(*) c FROM log_events").fetchone()["c"] == 1)
+
+        # A different, healthy file is still collected while the first blocks.
+        other = os.path.join(log_dir, "other.log")
+        with open(other, "w") as fh:
+            fh.write('{"path":"/other/ok","status":200}\n')
+        r3 = poll_once(conn, log_dir, read_chunk_bytes=chunk,
+                       max_line_bytes=max_line, carries=carries)
+        by_src = {x["source_code"]: x for x in r3["files"]}
+        check("blocked file stays blocked", by_src["access.log"]["blocked"])
+        check("other file ingested normally despite the block",
+              by_src["other.log"]["ingested"] == 1 and
+              not by_src["other.log"]["blocked"])
+        check("other file's rows are in the warehouse",
+              conn.execute(
+                  "SELECT COUNT(*) c FROM log_events WHERE source_code = "
+                  "'other.log'").fetchone()["c"] == 1)
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_block_clears_after_remediation():
+    print("\n[13] 超长行修复后自动解除阻塞，从原偏移续采、不漏不重")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        good = '{"path":"/ok","status":200}\n'
+        after = '{"path":"/after","status":500}\n'
+        with open(f, "wb") as fh:
+            fh.write(good.encode())
+            fh.write(b"x" * 400)
+            fh.write(b"\n")
+            fh.write(after.encode())
+
+        max_line, chunk = 64, 128
+        carries = {}
+        poll_once(conn, log_dir, read_chunk_bytes=chunk,
+                  max_line_bytes=max_line, carries=carries)
+        line_start = len(good.encode())
+        st = storage.all_states(conn)[0]
+        assert st["offset"] == line_start and st["blocked_reason"]
+
+        # Operator truncates the offending line below the limit, keeping the
+        # same byte position (file rewritten in place for the test).
+        with open(f, "wb") as fh:
+            fh.write(good.encode())
+            fh.write(b"x" * 20)
+            fh.write(b"\n")
+            fh.write(after.encode())
+        for _ in range(50):
+            poll_once(conn, log_dir, read_chunk_bytes=chunk,
+                      max_line_bytes=max_line, carries=carries)
+            st = storage.all_states(conn)[0]
+            if st["offset"] == os.path.getsize(f):
+                break
+        check("block marker cleared after remediation",
+              st["blocked_reason"] is None and st["blocked_at"] is None,
+              str(dict(st)))
+        check("file drained to EOF from the held offset",
+              st["offset"] == os.path.getsize(f))
+        rows = conn.execute(
+            "SELECT path FROM log_events ORDER BY id").fetchall()
+        check("no line skipped or duplicated after recovery",
+              [r["path"] for r in rows] == ["/ok", "/after"],
+              str([r["path"] for r in rows]))
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_crash_resume_within_batched_file():
+    print("\n[14] 分批提交的大文件在多次“进程退出”后续采：仅从最后批次恢复")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        total = 400
+        with open(f, "w") as fh:
+            for i in range(total):
+                fh.write(jline(f"/c/{i}", 200 if i % 5 else 500))
+
+        chunk = 2048
+        seen = 0
+        for _ in range(40):
+            # Brand-new connection each cycle = hard process exit; only the
+            # last committed batch can survive. The in-memory carry is lost
+            # too, so each restart re-reads the partial line from its
+            # committed start offset.
+            conn2 = storage.connect(db_path)
+            r = poll_once(conn2, log_dir, read_chunk_bytes=chunk,
+                          max_line_bytes=chunk - 1)
+            seen += r["ingested"]
+            conn2.close()
+            if seen >= total:
+                break
+        check(f"all {total} lines ingested across batched crash cycles",
+              seen == total, f"seen={seen}")
+        n = conn.execute("SELECT COUNT(*) c FROM log_events").fetchone()["c"]
+        check("exactly one row per physical line after recovery", n == total)
+        check("offsets committed per batch form a gapless sequence",
+              conn.execute(
+                  "SELECT COUNT(*) c FROM (SELECT DISTINCT byte_offset "
+                  "FROM log_events)").fetchone()["c"] == total)
+        paths = [r["path"] for r in conn.execute(
+            "SELECT path FROM log_events ORDER BY id").fetchall()]
+        check("row order/content matches the source exactly",
+              paths == [f"/c/{i}" for i in range(total)])
+        check("idle re-poll ingests nothing",
+              poll_once(conn, log_dir, read_chunk_bytes=chunk,
+                        max_line_bytes=chunk - 1)["ingested"] == 0)
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_long_line_completes_after_carry_losing_restart():
+    print("\n[15] 长行在丢失跨轮缓存的重启后，仍能在一轮内读到换行而不卡死")
+    from app.ingest import validate_limits
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        # The configured invariant itself must reject an unusable ordering.
+        for args, acceptable in (
+            ((1024, 1024), True), ((1024, 512), True),
+            ((512, 1024), False), ((0, 10), False), ((10, 0), False),
+        ):
+            try:
+                validate_limits(*args)
+                got = True
+            except ValueError:
+                got = False
+            check(f"validate_limits{args} {'accepts' if acceptable else 'rejects'}",
+                  got == acceptable)
+
+        f = os.path.join(log_dir, "access.log")
+        # One long line (~226 bytes) plus a normal line. With a 256-byte
+        # budget the long line fits one read once its first byte is reached.
+        long_line = b'{"path":"/long","pad":"' + b"a" * 200 + b'"}\n'
+        tail = b'{"path":"/tail","status":200}\n'
+        with open(f, "wb") as fh:
+            fh.write(long_line)
+            fh.write(tail)
+        size = os.path.getsize(f)
+
+        # Simulate a process that restarts on the long line's first poll:
+        # no in-memory carry exists, yet it must finish within the strict cap.
+        fresh = storage.connect(db_path)
+        r = poll_once(fresh, log_dir, read_chunk_bytes=256,
+                      max_line_bytes=256)
+        check("fresh start never exceeds the per-file byte budget",
+              r["bytes_read"] <= 256, str(r["bytes_read"]))
+        check("long line completed on a carry-less restart (no stall)",
+              r["ingested"] == 2, str(r["ingested"]))
+        st = storage.all_states(fresh)[0]
+        check("offset reaches EOF and no block is raised",
+              st["offset"] == size and st["blocked_reason"] is None,
+              str(dict(st)))
+        fresh.close()
+    finally:
         conn.close()
         shutil.rmtree(base)
 
@@ -503,5 +823,11 @@ if __name__ == "__main__":
     test_api()
     test_offset_math_after_partial()
     test_multibyte_offsets_and_chunk_boundaries()
+    test_bounded_bytes_per_poll()
+    test_fairness_other_files_not_starved()
+    test_oversized_line_blocks_with_reason()
+    test_block_clears_after_remediation()
+    test_crash_resume_within_batched_file()
+    test_long_line_completes_after_carry_losing_restart()
     print(f"\n==== {PASS} passed, {FAIL} failed ====")
     sys.exit(1 if FAIL else 0)

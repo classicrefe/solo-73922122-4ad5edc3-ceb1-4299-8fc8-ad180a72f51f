@@ -2,9 +2,9 @@
 
 Endpoints
 ---------
-GET  /health                 liveness + counters
-GET  /ingest/progress        per-file collection progress (offset/size)
-POST /ingest/poll-now        force an immediate collection pass
+GET  /health                 liveness, counters and active ingest limits
+GET  /ingest/progress        per-file progress (offset/size, blocked reason)
+POST /ingest/poll-now        force an immediate bounded collection pass
 GET  /events                 paginated events, filter by path / status /
                              status range / source code
 GET  /events/{event_id}      single event with the raw JSON line
@@ -20,10 +20,16 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from . import storage
-from .ingest import CollectorLoop, poll_once
+from .ingest import (
+    CollectorLoop,
+    MAX_LINE_BYTES,
+    READ_CHUNK,
+    poll_once,
+    validate_limits,
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -34,6 +40,13 @@ log = logging.getLogger("collector.api")
 DB_PATH = os.getenv("DB_PATH", "/data/warehouse.db")
 LOG_DIR = os.getenv("LOG_DIR", "/logs")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.5"))
+# Bounded, fair polling: at most READ_CHUNK_BYTES are read from any single
+# file per tick; a line longer than MAX_LINE_BYTES blocks that file (reported
+# on /ingest/progress) instead of being split or growing memory without bound.
+READ_CHUNK_BYTES = int(os.getenv("READ_CHUNK_BYTES", str(READ_CHUNK)))
+MAX_LINE_BYTES_CFG = int(os.getenv("MAX_LINE_BYTES", str(MAX_LINE_BYTES)))
+# Misconfiguration must fail at startup rather than silently stall ingestion.
+validate_limits(READ_CHUNK_BYTES, MAX_LINE_BYTES_CFG)
 
 
 class Health(BaseModel):
@@ -41,6 +54,8 @@ class Health(BaseModel):
     log_dir: str
     db_path: str
     poll_interval_seconds: float
+    read_chunk_bytes: int
+    max_line_bytes: int
     collector_running: bool
     total_polls: int
     total_ingested: int
@@ -56,12 +71,21 @@ class FileProgress(BaseModel):
     size: Optional[int] = None
     complete: bool
     last_seen: str
+    # True when a line at `offset` exceeds max_line_bytes. The file is held at
+    # that exact offset (not split, skipped or partially recorded); other
+    # files keep being collected while this one waits for remediation.
+    blocked: bool = False
+    blocked_reason: Optional[str] = None
+    blocked_at: Optional[str] = None
 
 
 class ProgressResponse(BaseModel):
     collector_running: bool
     total_polls: int
     total_ingested: int
+    read_chunk_bytes: int
+    max_line_bytes: int
+    blocked_count: int
     last_poll: Optional[dict] = None
     counts: dict
     files: list[FileProgress]
@@ -98,7 +122,11 @@ async def lifespan(app: FastAPI):
     conn = storage.connect(DB_PATH)
     storage.init_db(conn)
 
-    loop = CollectorLoop(conn, LOG_DIR, interval=POLL_INTERVAL)
+    loop = CollectorLoop(
+        conn, LOG_DIR, interval=POLL_INTERVAL,
+        read_chunk_bytes=READ_CHUNK_BYTES,
+        max_line_bytes=MAX_LINE_BYTES_CFG,
+    )
     thread = threading.Thread(target=loop.run_forever, name="collector",
                               daemon=True)
     thread.start()
@@ -142,6 +170,8 @@ def health():
         log_dir=LOG_DIR,
         db_path=DB_PATH,
         poll_interval_seconds=POLL_INTERVAL,
+        read_chunk_bytes=READ_CHUNK_BYTES,
+        max_line_bytes=MAX_LINE_BYTES_CFG,
         collector_running=threading.main_thread().is_alive() and not loop._stop,
         total_polls=loop.total_polls,
         total_ingested=loop.total_ingested,
@@ -167,8 +197,12 @@ def progress():
         pass
 
     files = []
+    blocked_count = 0
     for row in rows:
         size = current.get((row["dev"], row["inode"]))
+        is_blocked = row["blocked_reason"] is not None
+        if is_blocked:
+            blocked_count += 1
         files.append(FileProgress(
             source_code=row["source_code"],
             dev=row["dev"],
@@ -176,13 +210,20 @@ def progress():
             path=row["path"],
             offset=row["offset"],
             size=size,
-            complete=(size is not None and row["offset"] >= size),
+            complete=(not is_blocked and size is not None
+                      and row["offset"] >= size),
             last_seen=row["last_seen"],
+            blocked=is_blocked,
+            blocked_reason=row["blocked_reason"],
+            blocked_at=row["blocked_at"],
         ))
     return ProgressResponse(
         collector_running=not loop._stop,
         total_polls=loop.total_polls,
         total_ingested=loop.total_ingested,
+        read_chunk_bytes=READ_CHUNK_BYTES,
+        max_line_bytes=MAX_LINE_BYTES_CFG,
+        blocked_count=blocked_count,
         last_poll=loop.last_result,
         counts=storage.counts(conn),
         files=files,
@@ -194,7 +235,12 @@ def poll_now():
     """Force an immediate scan/ingest pass (useful for tests/demos)."""
     loop: CollectorLoop = state["loop"]
     with loop.write_lock:
-        return poll_once(_conn(), LOG_DIR)
+        return poll_once(
+            _conn(), LOG_DIR,
+            read_chunk_bytes=loop.read_chunk_bytes,
+            max_line_bytes=loop.max_line_bytes,
+            carries=loop._carries,
+        )
 
 
 @app.get("/events", response_model=EventPage, tags=["query"])
